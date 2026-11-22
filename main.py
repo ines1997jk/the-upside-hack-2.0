@@ -13,7 +13,7 @@ from langchain_classic.chains.combine_documents import create_stuff_documents_ch
 from langchain_core.prompts import ChatPromptTemplate
 
 # 1. Initialisation du modèle (llama3)
-llm = ChatOllama(model="gemma3:1b", temperature=0.3)
+llm = ChatOllama(model="gemma3:1b", temperature=0.3, num_ctx=2048)
 
 
 def charger_et_creer_memoire(fichier_pdf):
@@ -102,7 +102,12 @@ def _appeler_llm_json(prompt, max_tentatives=1):
         try:
             response = llm.invoke(prompt, format="json")
         except TypeError:
-            response = llm.invoke(prompt)
+            try:
+                response = llm.invoke(prompt)
+            except Exception:
+                return None
+        except Exception:
+            return None
 
         data = _parser_json_robuste(response.content)
         if data is not None:
@@ -453,7 +458,13 @@ def chercher_exercices_dans_pdf(fichier_pdf, partie):
 
     return exercices_trouves
 
-def proposer_exercices_apres_etude(fichier_pdf, partie, retriever=None, niveau="Facile"):
+def proposer_exercices_apres_etude(
+    fichier_pdf,
+    partie,
+    retriever=None,
+    niveau="Facile",
+    contexte=None
+):
     """
     1. Cherche des exercices (TD) dans le PDF.
     2. Si aucun exercice correspondant n'est trouvé,
@@ -475,11 +486,16 @@ def proposer_exercices_apres_etude(fichier_pdf, partie, retriever=None, niveau="
     print("Aucun exercice correspondant trouvé dans le PDF.")
     print("Génération d'un exercice avec le LLM...")
 
-    if retriever is None:
+    if retriever is None and contexte is None:
         retriever = obtenir_retriever(fichier_pdf)
 
     try:
-        exercice = generer_exercice(retriever, partie, niveau)
+        exercice = generer_exercice(
+            retriever,
+            partie,
+            niveau,
+            contexte
+        )
     except Exception as erreur:
         return {
             "partie": partie,
@@ -706,8 +722,58 @@ def extraire_note(feedback_texte):
         return float(match.group(1))
     return 0.0 
 
-def generer_exercice(retriever, sujet, niveau="Facile"):
-    contexte = retriever.invoke(sujet)[0].page_content
+
+def nettoyer_contexte(texte, limite=3000):
+    """Nettoie le texte brut du PDF : supprime les symboles isolés et les espaces inutiles."""
+    lignes = []
+    for ligne in texte.splitlines():
+        ligne = " ".join(ligne.split())
+        if len(ligne) <= 2:
+            continue
+        lignes.append(ligne)
+    return "\n".join(lignes)[:limite]
+
+
+def contexte_de_la_partie(etat, partie):
+    """Texte exact du chapitre étudié, plutôt qu'un morceau pris au hasard."""
+    infos = etat.get("chapitres", {}).get(partie)
+    if infos and infos.get("texte"):
+        return nettoyer_contexte(infos["texte"])
+    return None
+
+
+def _contexte_par_recherche(retriever, sujet):
+    documents = retriever.invoke(sujet)[:3]
+    return nettoyer_contexte(
+        "\n\n".join(document.page_content for document in documents)
+    )
+
+
+def _nettoyer_enonce(texte):
+    lignes = texte.strip().splitlines()
+    while lignes and (
+        not lignes[0].strip()
+        or lignes[0].strip().lower().startswith("voici")
+    ):
+        lignes.pop(0)
+    texte = "\n".join(lignes).strip()
+    texte = re.sub(
+        r"^\*{0,2}(Question|Exercice)\s*:?\s*\*{0,2}\s*",
+        "",
+        texte,
+        flags=re.IGNORECASE
+    )
+    return texte.strip()
+
+
+def generer_exercice(
+    retriever,
+    sujet,
+    niveau="Facile",
+    contexte=None
+):
+    if contexte is None:
+        contexte = _contexte_par_recherche(retriever, sujet)
     
     prompt = f"""
     Tu es un professeur. En te basant UNIQUEMENT sur ce contexte du cours :
@@ -723,65 +789,132 @@ def generer_exercice(retriever, sujet, niveau="Facile"):
     - **Difficile** : Un problème complexe, une démonstration ou un cas général (ex: prouver une propriété ou analyser un contre-exemple).
     
     Ne donne PAS la réponse, donne juste la question de l'exercice.
-    """
-    response = llm.invoke(prompt)
-    return response.content
 
-def evaluer_etudiant(reponse_etudiant, question, sujet, tentative=1):
-    prompt = f"""
-    Tu es un système d'évaluation académique impitoyable et ultra-strict. 
-    Ton rôle est de déterminer si un étudiant est autorisé à passer à la section suivante de son cours.
-    
-    RÈGLE DE NOTATION ABSOLUE (Ne déroge JAMAIS à ces règles, sois impitoyable sur la note) :
-    - Si la réponse est fausse, hors sujet ou inventée : NOTE = 2/20 (Maximum).
-    - Si la réponse est incomplète (il manque des mots-clés importants) : NOTE = 10/20 (Maximum).
-    - Si la réponse est bonne mais qu'il manque une seule nuance : NOTE = 15/20 (Maximum).
-    - Si la réponse est parfaite et exhaustive : NOTE = 20/20.
-    *La note ne doit en aucun cas refléter de la sympathie ou de l'encouragement.*
-    
-    Sujet : {sujet}
-    Question posée : {question}
-    Réponse de l'étudiant : "{reponse_etudiant}"
-    Numéro de tentative de l'étudiant : {tentative}
-    
-    Voici le BARÈME ULTRA-STRICT à appliquer :
-    - 0 à 5 : Hors sujet, réponse complètement fausse, ou invention de concepts.
-    - 6 à 12 : L'étudiant a compris l'idée générale mais il y a des erreurs de vocabulaire ou des approximations.
-    - 13 à 19 : La réponse est très bonne, mais il manque UNE précision ou un détail important.
-    - 20 : La réponse est parfaite, exhaustive, utilise le vocabulaire exact du cours et répond à tous les aspects de la question.
-    
-    Tu DOIS structurer ta réponse EXACTEMENT dans cet ordre, avec ces titres :
-    
-    1. ❌ **Les Lacunes** : Qu'est-ce qui manque ou est faux? Liste de manière objective et factuelle les éléments qui manquent ou qui sont incorrects. Ne sois pas sévère dans le ton, sois juste précis sur l'information manquante.
-    2. ✅ **Les Points Forts** : Qu'a-t-il bien compris, même si c'est infime ?
-    3. 🔥 **Feedback** : Sois direct. S'il a moins de 20, dis-lui qu'il doit réviser cette partie avant de continuer.
-    4. 🔍 **Analyse des erreurs** : Explique-lui en détail quelles notions il a utilisées à tort, et pourquoi ce n'était pas la bonne approche.
-    5. 💡 **Aide (Indice ou Réponse)** : 
-       - SI la note est < 20 ET que tentative <=3 : Ne donne PAS la réponse. Donne un INDICE clair pour aider l'étudiant à trouver la réponse par lui-même.
-       - SI la note est < 20 ET que tentative == 4 : C'est la 4ème fois. l'agent donne la réponse correcte et détaillée.
-    6. 📊 **La Note Finale** : Donne la note sur 20 sous ce format exact : [NOTE : X/20].
-    7. 🔒 **Statut de progression** : Si la note est strictement égale à 20/20, écris "[STATUT : DÉBLOQUÉ]". Sinon, écris "[STATUT : VERROUILLÉ - RÉVISION NÉCESSAIRE]".
+    RÈGLES IMPORTANTES :
+    - Le contexte vient d'une extraction PDF : des symboles mathématiques sont perdus.
+    - Ne recopie JAMAIS le texte brut du contexte dans l'exercice.
+    - Écris toi-même un énoncé propre, complet et lisible, avec la notation mathématique standard.
+    - Ne donne PAS la réponse.
+    - Réponds UNIQUEMENT par l'énoncé : pas d'introduction, pas de titre, pas de mention du niveau.
     """
     response = llm.invoke(prompt)
-    return response.content
+    return _nettoyer_enonce(response.content)
 
-def generer_exercice_remediation(retriever, sujet, feedback_precedent, ancien_exercice, niveau_actuel):
-    contexte = retriever.invoke(sujet)[0].page_content
-    
-    prompt = f"""
-    Tu es un professeur. L'étudiant a échoué à l'exercice de niveau {niveau_actuel}.
-    Voici l'ancien exercice (INTERDIT de le redonner) : "{ancien_exercice}"
-    Voici le feedback de ses erreurs : "{feedback_precedent}"
-    
-    En te basant UNIQUEMENT sur ce contexte du cours :
-    {contexte}
-    
-    Ta mission : Génère un NOUVEL exercice de niveau {niveau_actuel}, mais plus guidé ou plus simple dans sa formulation, 
-    qui cible SPÉCIFIQUEMENT les lacunes de l'étudiant pour l'aider à surmonter ses erreurs.
-    Ne donne pas la réponse. Donne juste le nouvel exercice.
+
+def evaluer_etudiant(
+    reponse_etudiant,
+    question,
+    sujet,
+    tentative,
+    retriever=None,
+    contexte=None,
+    max_tentatives=4
+):
     """
-    response = llm.invoke(prompt)
-    return response.content
+    Évalue une réponse.
+    Tentatives 1 à 3 : indice uniquement.
+    Tentative 4 : correction détaillée si la réponse est fausse.
+    """
+
+    if contexte is None:
+        contexte = _contexte_par_recherche(retriever, sujet)
+
+    prompt = f"""
+Tu es un professeur universitaire spécialisé en mathématiques.
+
+CONTEXTE DU COURS :
+{contexte}
+
+SUJET : {sujet}
+
+QUESTION :
+{question}
+
+RÉPONSE DE L'ÉTUDIANT :
+{reponse_etudiant}
+
+NUMÉRO DE TENTATIVE :
+{tentative}/{max_tentatives}
+
+Ta mission est de vérifier si la réponse de l'étudiant
+est mathématiquement correcte.
+
+RÈGLES ABSOLUES :
+
+1. Si la réponse est correcte :
+   - correct = true
+   - donne un bref message d'encouragement.
+   - score = 20.
+   - Ne donne pas de nouvel indice.
+
+2. Si la réponse est incorrecte et que tentative < {max_tentatives} :
+   - correct = false.
+   - Donne UNIQUEMENT un indice.
+   - Ne donne PAS la définition complète.
+   - Ne donne PAS la réponse correcte.
+   - Ne donne PAS la démonstration.
+   - Ne révèle pas directement les éléments attendus.
+   - L'indice doit aider l'étudiant à réfléchir.
+
+3. Si la réponse est incorrecte et que tentative == {max_tentatives} :
+   - correct = false.
+   - Donne une correction détaillée.
+   - Explique le raisonnement étape par étape.
+   - Donne la définition correcte du cours.
+   - Explique précisément l'erreur de l'étudiant.
+
+IMPORTANT :
+- Ne donne jamais la correction avant la {max_tentatives}e tentative.
+- Ne confonds pas une réponse approximative avec une réponse correcte.
+- Vérifie les affirmations mathématiques.
+- N'invente aucune définition.
+
+RENVOIE UNIQUEMENT UN JSON :
+
+Si la réponse est correcte :
+{{
+    "correct": true,
+    "message": "Message de réussite",
+    "hint": "",
+    "solution": ""
+}}
+
+Si la réponse est fausse avant la quatrième tentative :
+{{
+    "correct": false,
+    "message": "",
+    "hint": "Un seul indice progressif",
+    "solution": ""
+}}
+
+Si la réponse est fausse à la {max_tentatives}e tentative :
+{{
+    "correct": false,
+    "message": "",
+    "hint": "",
+    "solution": "Correction détaillée"
+}}
+"""
+
+    resultat = _appeler_llm_json(prompt)
+
+    # Sécurité si le LLM ne renvoie pas un JSON valide
+    if not isinstance(resultat, dict):
+        return {
+            "correct": False,
+            "message": "",
+            "hint": "Relis attentivement la question et identifie la définition du cours qui pourrait t'aider.",
+            "solution": ""
+        }
+
+    # Empêcher l'affichage d'une correction avant la dernière tentative
+    if not resultat.get("correct", False) and tentative < max_tentatives:
+        resultat["solution"] = ""
+        resultat["hint"] = resultat.get("hint") or (
+            "Reprends la définition du cours et réfléchis aux notions utilisées."
+        )
+
+    return resultat
 
 
 def initialiser_exercice(student_answer="", correct_answer="", attempts=0):
@@ -812,11 +945,16 @@ def soumettre_reponse_exercice(exercise_state, reponse_etudiant, exercice):
             "exercise_state": exercise_state
         }
 
-    if exercise_state["attempts"] >= 3:
+    if exercise_state["attempts"] >= 4:
         exercise_state["show_solution"] = True
 
     if exercise_state["show_solution"]:
-        niveau_aide = "montre la correction complete avec les etapes"
+        niveau_aide = """
+        Donne la CORRECTION COMPLETE et DETAILLEE :
+        1. La reponse finale correcte.
+        2. Le raisonnement etape par etape.
+        3. Les notions du cours utilisees.
+        """
     else:
         niveau_aide = "explique l'erreur et donne seulement un indice pour continuer"
 
@@ -828,7 +966,9 @@ def soumettre_reponse_exercice(exercise_state, reponse_etudiant, exercice):
     Reponse attendue : {exercise_state["correct_answer"]}
     Consigne : {niveau_aide}
 
-    Ne juge pas l'etudiant. Explique clairement l'erreur et aide-le a poursuivre.
+    Ne juge pas l'etudiant.
+    Si la correction est demandee, explique clairement la reponse finale,
+    le raisonnement etape par etape et les notions du cours utilisees.
     """
     response = llm.invoke(prompt)
     return {
@@ -845,6 +985,50 @@ def demander_correction(exercise_state):
         "exercise_state": exercise_state
     }
 
+
+def generer_exercice_remediation(
+    retriever,
+    sujet,
+    feedback_precedent,
+    ancien_exercice,
+    niveau_actuel="Facile",
+    contexte=None
+):
+    if contexte is None:
+        contexte = _contexte_par_recherche(retriever, sujet)
+
+    prompt = f"""
+Tu es un professeur qui prépare un exercice de remédiation.
+
+SUJET :
+{sujet}
+
+ANCIEN EXERCICE :
+{ancien_exercice}
+
+ERREUR OU INDICE PRÉCÉDENT :
+{feedback_precedent}
+
+NIVEAU :
+{niveau_actuel}
+
+CONTEXTE DU COURS :
+{contexte}
+
+Génère un NOUVEL exercice ciblé sur les lacunes de l'étudiant.
+Ne redonne pas exactement l'ancien exercice.
+Reste progressif, simple et guidé.
+Ne donne pas la correction.
+Retourne uniquement l'énoncé de l'exercice.
+
+RÈGLES IMPORTANTES :
+- Le contexte vient d'une extraction PDF : des symboles mathématiques sont perdus.
+- Ne recopie JAMAIS le texte brut du contexte dans l'exercice.
+- Écris toi-même un énoncé propre, complet et lisible, avec la notation mathématique standard.
+- Ne donne PAS la réponse.
+- Réponds UNIQUEMENT par l'énoncé : pas d'introduction, pas de titre, pas de mention du niveau.
+"""
+    return _nettoyer_enonce(llm.invoke(prompt).content)
 
 
 # ==========================================
@@ -904,63 +1088,148 @@ def construire_resultat_evaluation(feedback_texte):
     }
 
 
+
 def lancer_session_exercices(etat, niveau="Facile"):
     """
-    1. Cherche un TD dans le PDF pour la partie actuelle.
-    2. S'il n'y en a pas, génère l'exercice avec le LLM.
-    3. Évalue la réponse, met à jour le planning à CHAQUE exercice,
-       donne des XP, et génère un exercice de remédiation en cas d'échec.
+    - Génère ou récupère un exercice.
+    - Autorise 4 tentatives sur le même exercice.
+    - Donne uniquement un indice après les tentatives 1, 2 et 3.
+    - Donne la correction détaillée après la tentative 4.
+    - Valide la partie uniquement si la réponse est correcte.
     """
+
     partie = etat["partie_actuelle"]
     fichier_pdf = etat["fichier_pdf"]
+    contexte = contexte_de_la_partie(etat, partie)
+    retriever = None
+    if contexte is None:
+        retriever = obtenir_retriever(fichier_pdf)
+        contexte = _contexte_par_recherche(retriever, partie)
 
-    proposition = proposer_exercices_apres_etude(fichier_pdf, partie, niveau=niveau)
+    proposition = proposer_exercices_apres_etude(
+        fichier_pdf,
+        partie,
+        retriever=retriever,
+        niveau=niveau,
+        contexte=contexte
+    )
+
     exercices = proposition.get("exercices", [])
+
     if not exercices:
         print(proposition.get("erreur", "Aucun exercice disponible."))
         return obtenir_planning_adaptatif(etat)
 
     premier = exercices[0]
-    question = premier if isinstance(premier, str) else premier.get("enonce", str(premier))
+
+    question = (
+        premier if isinstance(premier, str)
+        else premier.get("enonce", str(premier))
+    )
 
     tentative = 1
     planning = obtenir_planning_adaptatif(etat)
 
-    while True:
-        print(f"\n📝 EXERCICE (source : {proposition.get('source')}, tentative {tentative}) :")
+    # Les quatre tentatives concernent le même exercice
+    while tentative <= 4:
+
+        print(
+            f"\n📝 EXERCICE "
+            f"(tentative {tentative}/4) :"
+        )
+
         print(question)
 
-        reponse = input("\n✍️ Ta réponse (ou 'stop' pour arrêter) : ").strip()
+        reponse = input(
+            "\n✍️ Ta réponse : "
+        ).strip()
+
         if reponse.lower() == "stop":
             break
 
-        feedback = evaluer_etudiant(reponse, question, partie, tentative)
-        print("\n" + feedback)
+        evaluation = evaluer_etudiant(
+            reponse,
+            question,
+            partie,
+            tentative,
+            retriever,
+            contexte,
+            4
+        )
 
-        resultat = construire_resultat_evaluation(feedback)
+        # CAS 1 : Réponse correcte
+        if evaluation.get("correct") is True:
 
-        # Le planning s'adapte après chaque exercice
-        planning = mettre_a_jour_progression(etat, resultat)
+            print("\n✅ BRAVO !")
+            print(evaluation.get("message", "Bonne réponse !"))
+            print("\n📊 NOTE : 20/20")
 
-        ajouter_points("Vous", int(resultat["score_sur_20"]))
+            resultat = {
+                "score_sur_20": 20,
+                "lacunes": "",
+                "maitrise_validee": True
+            }
 
-        if resultat["maitrise_validee"]:
+            planning = mettre_a_jour_progression(
+                etat,
+                resultat
+            )
+
+            ajouter_points("Vous", 20)
             ajouter_points("Vous", 50)
-            print("\n🔓 Partie validée, la suite est débloquée !")
+
+            print("\n🔓 Exercice validé !")
+            print("La partie suivante est débloquée.")
+
             break
 
-        print("\n🔁 Nouvel exercice de remédiation ciblé sur tes lacunes...")
-        question = generer_exercice_remediation(
-            obtenir_retriever(fichier_pdf),
-            partie,
-            feedback,
-            question,
-            niveau
-        )
-        tentative += 1
+        # CAS 2 : Réponse incorrecte
+        print("\n❌ Réponse incorrecte.")
+
+        if tentative < 4:
+
+            # Afficher UNIQUEMENT l'indice
+            print("\n💡 INDICE :")
+            print(evaluation.get("hint", ""))
+
+            tentative += 1
+
+            print("\n🔁 Nouvel exercice de remédiation ciblé...")
+            question = generer_exercice_remediation(
+                None,
+                partie,
+                evaluation.get("message", evaluation.get("hint", "")),
+                question,
+                niveau,
+                contexte
+            )
+
+        else:
+
+            # Quatrième échec : correction complète
+            print("\n📖 CORRECTION DÉTAILLÉE :")
+            print(evaluation.get("solution", ""))
+
+            resultat = {
+                "score_sur_20": 0,
+                "lacunes": "La notion n'est pas encore maîtrisée.",
+                "maitrise_validee": False
+            }
+
+            planning = mettre_a_jour_progression(
+                etat,
+                resultat
+            )
+
+            print("\n🔒 Partie non validée.")
+            print("Tu dois réviser cette notion avant de continuer.")
+
+            break
 
     afficher_classement()
+
     return planning
+
 # ==========================================
 # ZONE DE TEST
 # ==========================================
